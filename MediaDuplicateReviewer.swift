@@ -191,6 +191,7 @@ final class MediaScanner {
     static let videoExtensions: Set<String> = [
         "mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts", "mpg", "mpeg", "3gp", "webm"
     ]
+    static let livePhotoStillExtensions: Set<String> = ["heic", "heif", "jpg", "jpeg"]
 
     static func rootsOverlap(_ first: URL, _ second: URL) -> Bool {
         let a = first.standardizedFileURL.resolvingSymlinksInPath().pathComponents
@@ -276,7 +277,11 @@ final class MediaScanner {
     }
 
     static func possibleCompanions(items: [MediaItem]) -> [String: MediaItem] {
-        let byKey = Dictionary(grouping: items, by: \.companionLookupKey)
+        let eligible = items.filter {
+            ($0.kind == .image && livePhotoStillExtensions.contains($0.extensionLower)) ||
+            ($0.kind == .video && $0.extensionLower == "mov")
+        }
+        let byKey = Dictionary(grouping: eligible, by: \.companionLookupKey)
         var companions: [String: MediaItem] = [:]
         for group in byKey.values {
             guard let image = group.first(where: { $0.kind == .image }),
@@ -742,7 +747,7 @@ final class ReviewModel: ObservableObject {
                 self.companionByID = companions
                 self.exactGroups = exact
                 self.exactIDs = exactSet
-                self.photoPairs = photos
+                self.photoPairs = self.applyCompanionAwarePhotoSuggestions(photos)
                 self.section = exact.isEmpty ? .photos : .exact
                 self.page = 0
                 self.hasScanned = true
@@ -800,11 +805,47 @@ final class ReviewModel: ObservableObject {
 
     func selectExactKeeping(preferredRoot: String?) {
         for group in exactGroups {
-            let keep: MediaItem
-            if let preferredRoot, let preferred = group.items.first(where: { $0.rootLabel == preferredRoot }) { keep = preferred }
-            else { keep = group.items.sorted { $0.relativePath < $1.relativePath }.first! }
+            let keep = chooseKeepItem(in: group, preferredRoot: preferredRoot)
             for item in group.items where item.id != keep.id { selectedIDs.insert(item.id) }
             selectedIDs.remove(keep.id)
+        }
+    }
+
+    private func chooseKeepItem(in group: ExactGroup, preferredRoot: String?) -> MediaItem {
+        let sorted = group.items.sorted { $0.relativePath < $1.relativePath }
+        if let preferredRoot {
+            let candidates = sorted.filter { $0.rootLabel == preferredRoot }
+            if let chosen = companionPreferredItem(from: candidates) { return chosen }
+        }
+        if let chosen = companionPreferredItem(from: sorted) { return chosen }
+        return sorted.first!
+    }
+
+    private func companionPreferredItem(from items: [MediaItem]) -> MediaItem? {
+        guard !items.isEmpty else { return nil }
+        return items.max { a, b in
+            let aHasCompanion = companionByID[a.id] != nil
+            let bHasCompanion = companionByID[b.id] != nil
+            if aHasCompanion != bHasCompanion { return !aHasCompanion && bHasCompanion }
+            if a.byteSize != b.byteSize { return a.byteSize < b.byteSize }
+            return a.relativePath > b.relativePath
+        }
+    }
+
+    private func applyCompanionAwarePhotoSuggestions(_ pairs: [ReviewPair]) -> [ReviewPair] {
+        pairs.map { pair in
+            guard pair.type == .similarImage else { return pair }
+            guard pair.suggestedTrashID == nil else { return pair }
+            let leftCompanion = companionByID[pair.left.id] != nil
+            let rightCompanion = companionByID[pair.right.id] != nil
+            guard leftCompanion != rightCompanion else { return pair }
+            let trash = leftCompanion ? pair.right : pair.left
+            return ReviewPair(
+                id: pair.id, left: pair.left, right: pair.right, type: pair.type,
+                similarityDistance: pair.similarityDistance, reason: pair.reason,
+                suggestedTrashID: trash.id,
+                suggestionText: "Companion-aware suggestion: keep the version stored with its .MOV companion to avoid splitting a Live Photo pair across roots."
+            )
         }
     }
 
@@ -1023,6 +1064,39 @@ struct SelectedRow: View {
 
 struct ContentView: View {
     @EnvironmentObject var model: ReviewModel
+    struct PairCluster: Identifiable {
+        let id: String
+        let pairs: [ReviewPair]
+        let itemCount: Int
+    }
+    func clusters(for pairs: [ReviewPair]) -> [PairCluster] {
+        guard !pairs.isEmpty else { return [] }
+        var adjacency: [String: Set<String>] = [:]
+        var pairIDsByItem: [String: [ReviewPair]] = [:]
+        for pair in pairs {
+            adjacency[pair.left.id, default: []].insert(pair.right.id)
+            adjacency[pair.right.id, default: []].insert(pair.left.id)
+            pairIDsByItem[pair.left.id, default: []].append(pair)
+            pairIDsByItem[pair.right.id, default: []].append(pair)
+        }
+        var seenItems = Set<String>()
+        var clusters: [PairCluster] = []
+        for start in adjacency.keys where !seenItems.contains(start) {
+            var queue = [start]
+            var itemSet = Set<String>()
+            var pairMap: [String: ReviewPair] = [:]
+            while let item = queue.popLast() {
+                if !seenItems.insert(item).inserted { continue }
+                itemSet.insert(item)
+                for pair in pairIDsByItem[item] ?? [] { pairMap[pair.id] = pair }
+                for next in adjacency[item] ?? [] where !seenItems.contains(next) { queue.append(next) }
+            }
+            let clusteredPairs = pairMap.values.sorted { $0.left.relativePath < $1.left.relativePath }
+            let clusterID = itemSet.sorted().joined(separator: "|")
+            clusters.append(PairCluster(id: clusterID, pairs: clusteredPairs, itemCount: itemSet.count))
+        }
+        return clusters.sorted { ($0.pairs.first?.left.relativePath ?? "") < ($1.pairs.first?.left.relativePath ?? "") }
+    }
     var body: some View { VStack(spacing: 0) { header; Divider(); toolbar; Divider(); results }.frame(minWidth: 1120, minHeight: 780) }
     var header: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1085,10 +1159,26 @@ struct ContentView: View {
                     ForEach(model.currentExactPage) { ExactGroupCard(group: $0) }
                 case .photos:
                     if model.photoPairs.isEmpty { empty("No visually confirmed non-identical photo pairs found with the current scan mode.") }
-                    ForEach(model.currentPairPage) { PairCard(pair: $0) }
+                    ForEach(clusters(for: model.currentPairPage)) { cluster in
+                        if cluster.pairs.count > 1 {
+                            Text("Linked variant cluster: \(cluster.itemCount) files across \(cluster.pairs.count) related comparisons. Selecting one file affects all rows where that same file appears.")
+                                .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 6)
+                        }
+                        ForEach(cluster.pairs) { PairCard(pair: $0) }
+                    }
                 case .videos:
                     if model.videoPairs.isEmpty { empty("Run Analyze Non-identical Videos. Exact identical videos already appear under Exact Copies.") }
-                    ForEach(model.currentPairPage) { PairCard(pair: $0) }
+                    ForEach(clusters(for: model.currentPairPage)) { cluster in
+                        if cluster.pairs.count > 1 {
+                            Text("Linked variant cluster: \(cluster.itemCount) files across \(cluster.pairs.count) related comparisons. Selecting one file affects all rows where that same file appears.")
+                                .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 6)
+                        }
+                        ForEach(cluster.pairs) { PairCard(pair: $0) }
+                    }
                 case .selected:
                     if model.selectedItems.isEmpty { empty("No files selected for Trash.") }
                     ForEach(model.selectedItems) { SelectedRow(item: $0) }
