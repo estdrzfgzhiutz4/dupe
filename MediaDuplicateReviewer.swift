@@ -395,7 +395,7 @@ final class MediaScanner {
 
         // Suggestions are more conservative than listing a visual match.
         // This prevents two merely similar shots from becoming automatic deletion candidates.
-        guard distance <= 0.060, compatibleAspect(first, second, tolerance: 0.025),
+        guard distance <= 0.105, compatibleAspect(first, second, tolerance: 0.025),
               let firstPixels = first.pixelCount, let secondPixels = second.pixelCount else {
             return (nil, nil)
         }
@@ -790,8 +790,24 @@ final class ReviewModel: ObservableObject {
     }
 
     func toggle(_ item: MediaItem, against other: MediaItem? = nil) {
-        if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
-        else { if let other { selectedIDs.remove(other.id) }; selectedIDs.insert(item.id) }
+        if selectedIDs.contains(item.id) {
+            selectedIDs.remove(item.id)
+            return
+        }
+        if let other { selectedIDs.remove(other.id) }
+
+        // Safety in clustered variants: do not allow selecting every file in a linked cluster.
+        let cluster = variantClusters(from: photoPairs + videoPairs).first { $0.contains(item.id) } ?? []
+        if !cluster.isEmpty {
+            var prospective = selectedIDs
+            prospective.insert(item.id)
+            if cluster.isSubset(of: prospective) {
+                showMessage(title: "Keep one file in each variant cluster",
+                            text: "This selection would mark every file in a linked variant cluster. Leave at least one file unselected.")
+                return
+            }
+        }
+        selectedIDs.insert(item.id)
     }
 
     func toggleExact(_ item: MediaItem, group: ExactGroup) {
@@ -1061,28 +1077,35 @@ struct VariantClusterCard: View {
     }
     var rootAItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "A" } }
     var rootBItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "B" } }
+    var suggestedIDs: Set<String> { Set(cluster.pairs.compactMap(\.suggestedTrashID)) }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Variant cluster · \(cluster.itemCount) files · \(cluster.pairs.count) related matches")
                 .font(.headline).foregroundStyle(.orange)
-            Text("Grouped by root. Each file is shown once; selecting it applies everywhere it appears.")
+            Text("Grouped by root. Each file appears once; selecting one applies across all linked comparisons.")
                 .font(.caption).foregroundStyle(.secondary)
 
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Root A").font(.subheadline).fontWeight(.semibold)
                     ForEach(rootAItems) { item in
-                        MediaSideCard(item: item, other: nil, suggested: false)
+                        MediaSideCard(item: item, other: nil, suggested: suggestedIDs.contains(item.id))
                     }
                     if rootAItems.isEmpty { Text("No files in this cluster from Root A").font(.caption).foregroundStyle(.secondary) }
-                }
+                }.frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(10)
+                    .background(Color.blue.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Root B").font(.subheadline).fontWeight(.semibold)
                     ForEach(rootBItems) { item in
-                        MediaSideCard(item: item, other: nil, suggested: false)
+                        MediaSideCard(item: item, other: nil, suggested: suggestedIDs.contains(item.id))
                     }
                     if rootBItems.isEmpty { Text("No files in this cluster from Root B").font(.caption).foregroundStyle(.secondary) }
-                }
+                }.frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(10)
+                    .background(Color.green.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             VStack(alignment: .leading, spacing: 5) {
                 Text("Related pair links").font(.subheadline).fontWeight(.semibold)
