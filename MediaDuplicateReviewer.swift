@@ -191,6 +191,7 @@ final class MediaScanner {
     static let videoExtensions: Set<String> = [
         "mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts", "mpg", "mpeg", "3gp", "webm"
     ]
+    static let livePhotoStillExtensions: Set<String> = ["heic", "heif", "jpg", "jpeg"]
 
     static func rootsOverlap(_ first: URL, _ second: URL) -> Bool {
         let a = first.standardizedFileURL.resolvingSymlinksInPath().pathComponents
@@ -204,6 +205,7 @@ final class MediaScanner {
         var seenPaths = Set<String>()
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .creationDateKey, .contentTypeKey]
         for root in roots {
+            if Task.isCancelled { return results }
             progress("Scanning Root \(root.label): \(root.url.path)…")
             guard let enumerator = FileManager.default.enumerator(
                 at: root.url,
@@ -216,6 +218,7 @@ final class MediaScanner {
             ) else { continue }
             var count = 0
             for case let url as URL in enumerator {
+                if Task.isCancelled { return results }
                 autoreleasepool {
                     let canonical = url.standardizedFileURL.resolvingSymlinksInPath().path
                     guard !seenPaths.contains(canonical),
@@ -274,7 +277,11 @@ final class MediaScanner {
     }
 
     static func possibleCompanions(items: [MediaItem]) -> [String: MediaItem] {
-        let byKey = Dictionary(grouping: items, by: \.companionLookupKey)
+        let eligible = items.filter {
+            ($0.kind == .image && livePhotoStillExtensions.contains($0.extensionLower)) ||
+            ($0.kind == .video && $0.extensionLower == "mov")
+        }
+        let byKey = Dictionary(grouping: eligible, by: \.companionLookupKey)
         var companions: [String: MediaItem] = [:]
         for group in byKey.values {
             guard let image = group.first(where: { $0.kind == .image }),
@@ -301,6 +308,7 @@ final class MediaScanner {
             .values.filter { $0.count > 1 }.flatMap { $0 }
         var hashes: [String: [MediaItem]] = [:]
         for (index, item) in possible.enumerated() {
+            if Task.isCancelled { return [] }
             if let hash = sha256(item.url) { hashes[hash, default: []].append(item) }
             if index % 20 == 0 { progress("Hashing files with matching byte size: \(index + 1) of \(possible.count)…") }
         }
@@ -418,7 +426,12 @@ final class MediaScanner {
         return (nil, nil)
     }
 
-    static func similarPhotos(items: [MediaItem], excluding exactIDs: Set<String>, exhaustive: Bool,
+    static func isAllowedSimilarityPair(_ first: MediaItem, _ second: MediaItem, crossRootOnly: Bool) -> Bool {
+        guard first.id != second.id else { return false }
+        return !crossRootOnly || first.rootLabel != second.rootLabel
+    }
+
+    static func similarPhotos(items: [MediaItem], excluding exactIDs: Set<String>, exhaustive: Bool, crossRootOnly: Bool,
                               progress: @escaping (String) -> Void) -> [ReviewPair] {
         let images = items.filter { $0.kind == .image && !exactIDs.contains($0.id) }
         guard images.count >= 2 else { return [] }
@@ -429,6 +442,8 @@ final class MediaScanner {
             progress("Exhaustive mode: scheduling all \(images.count * (images.count - 1) / 2) photo pairs…")
             for i in 0..<(images.count - 1) {
                 for j in (i + 1)..<images.count {
+                    if Task.isCancelled { return [] }
+                    guard isAllowedSimilarityPair(images[i], images[j], crossRootOnly: crossRootOnly) else { continue }
                     candidates[PairKey(images[i].id, images[j].id), default: []].insert("exhaustive visual scan")
                 }
             }
@@ -437,9 +452,11 @@ final class MediaScanner {
             let tree = HammingBKTree()
             var hashes: [String: UInt64] = [:]
             for (index, item) in images.enumerated() {
+                if Task.isCancelled { return [] }
                 if let thumbnail = thumbnailCGImage(item.url, maxPixel: 256), let hash = dHash(thumbnail) {
                     hashes[item.id] = hash
                     for neighbor in tree.query(hash, within: 10) {
+                        guard let other = byID[neighbor], isAllowedSimilarityPair(item, other, crossRootOnly: crossRootOnly) else { continue }
                         candidates[PairKey(item.id, neighbor), default: []].insert("perceptual-hash neighbour")
                     }
                     tree.insert(hash, id: item.id)
@@ -456,10 +473,18 @@ final class MediaScanner {
             for group in byCapture.values { appendPairs(in: group, reason: "matching capture metadata", into: &candidates, limit: 100) }
         }
 
+        if crossRootOnly {
+            candidates = candidates.filter { key, _ in
+                guard let first = byID[key.first], let second = byID[key.second] else { return false }
+                return first.rootLabel != second.rootLabel
+            }
+        }
+
         progress("Confirming \(candidates.count) photo candidate pair(s) with Apple Vision…")
         var featureCache: [String: VNFeaturePrintObservation] = [:]
         var matches: [(MediaItem, MediaItem, Float, Set<String>)] = []
         for (index, entry) in candidates.enumerated() {
+            if Task.isCancelled { return [] }
             guard let first = byID[entry.key.first], let second = byID[entry.key.second] else { continue }
             if featureCache[first.id] == nil, let image = thumbnailCGImage(first.url, maxPixel: 720) {
                 featureCache[first.id] = featurePrint(from: image)
@@ -523,13 +548,14 @@ final class MediaScanner {
         return VideoSample(prints: observations, perceptualHashes: hashes)
     }
 
-    static func similarVideos(items: [MediaItem], excluding exactIDs: Set<String>, progress: @escaping (String) -> Void) -> [ReviewPair] {
+    static func similarVideos(items: [MediaItem], excluding exactIDs: Set<String>, crossRootOnly: Bool, progress: @escaping (String) -> Void) -> [ReviewPair] {
         let videos = items.filter { $0.kind == .video && !exactIDs.contains($0.id) }
         guard videos.count >= 2 else { return [] }
 
         progress("Preparing three-frame fingerprints for \(videos.count) non-identical videos…")
         var sampleCache: [String: VideoSample] = [:]
         for (index, item) in videos.enumerated() {
+            if Task.isCancelled { return [] }
             if let samples = videoSamples(item) { sampleCache[item.id] = samples }
             if index % 10 == 0 { progress("Reading video frame samples: \(index + 1) of \(videos.count)…") }
         }
@@ -543,6 +569,7 @@ final class MediaScanner {
             for i in 0..<(group.count - 1) {
                 for j in (i + 1)..<group.count {
                     let first = group[i], second = group[j]
+                    guard isAllowedSimilarityPair(first, second, crossRootOnly: crossRootOnly) else { continue }
                     if let a = first.durationSeconds, let b = second.durationSeconds,
                        abs(a - b) <= 1.0, compatibleAspect(first, second, tolerance: 0.04) {
                         candidates.insert(PairKey(first.id, second.id))
@@ -556,10 +583,12 @@ final class MediaScanner {
         let trees = [HammingBKTree(), HammingBKTree(), HammingBKTree()]
         var visualVotes: [PairKey: Int] = [:]
         for item in videos {
+            if Task.isCancelled { return [] }
             guard let sample = sampleCache[item.id] else { continue }
             for frameIndex in 0..<3 {
                 for neighborID in trees[frameIndex].query(sample.perceptualHashes[frameIndex], within: 10) {
                     guard let other = byID[neighborID],
+                          isAllowedSimilarityPair(item, other, crossRootOnly: crossRootOnly),
                           let firstDuration = item.durationSeconds,
                           let otherDuration = other.durationSeconds,
                           abs(firstDuration - otherDuration) <= 1.0,
@@ -570,10 +599,17 @@ final class MediaScanner {
             }
         }
         for (pair, votes) in visualVotes where votes >= 2 { candidates.insert(pair) }
+        if crossRootOnly {
+            candidates = Set(candidates.filter { key in
+                guard let first = byID[key.first], let second = byID[key.second] else { return false }
+                return first.rootLabel != second.rootLabel
+            })
+        }
 
         progress("Confirming \(candidates.count) indexed video candidate pair(s) at 10%, 50% and 90%…")
         var scored: [(MediaItem, MediaItem, Float, Int)] = []
         for (index, key) in candidates.enumerated() {
+            if Task.isCancelled { return [] }
             guard let first = byID[key.first], let second = byID[key.second],
                   let a = sampleCache[first.id], let b = sampleCache[second.id] else { continue }
             var distances: [Float] = []
@@ -642,6 +678,7 @@ final class ReviewModel: ObservableObject {
     private var allItems: [MediaItem] = []
     private var exactIDs = Set<String>()
     private var companionByID: [String: MediaItem] = [:]
+    private var activeTask: Task<Void, Never>?
     let pageSize = 50
 
     var itemsByID: [String: MediaItem] { Dictionary(uniqueKeysWithValues: allItems.map { ($0.id, $0) }) }
@@ -684,45 +721,54 @@ final class ReviewModel: ObservableObject {
 
     func startScan() {
         guard let aURL = rootA else { status = "Choose Root A first."; return }
+        activeTask?.cancel()
         if let bURL = rootB, MediaScanner.rootsOverlap(aURL, bURL) {
             showMessage(title: "Overlapping roots are not allowed", text: "Choose either the larger folder by itself, or two non-overlapping folders. A single root already finds duplicates inside that folder tree.")
             return
         }
         let roots = [ScanRoot(id: "A", label: "A", url: aURL)] + (rootB.map { [ScanRoot(id: "B", label: "B", url: $0)] } ?? [])
+        let crossRootOnly = rootB != nil
         exactGroups = []; photoPairs = []; videoPairs = []; selectedIDs = []; exactIDs = []; allItems = []; companionByID = [:]
         page = 0; hasScanned = false; isWorking = true; status = "Scanning selected collection…"
         let exhaustive = useExhaustivePhotoScan
-        Task.detached(priority: .userInitiated) {
+        activeTask = Task.detached(priority: .userInitiated) {
             let progress: (String) -> Void = { text in Task { @MainActor in self.status = text } }
             let items = MediaScanner.scan(roots: roots, progress: progress)
+            guard !Task.isCancelled else { await MainActor.run { self.status = "Scan stopped."; self.isWorking = false }; return }
             let companions = MediaScanner.possibleCompanions(items: items)
             progress("Checking exact duplicates throughout the collection…")
             let exact = MediaScanner.exactGroups(items: items, progress: progress)
+            guard !Task.isCancelled else { await MainActor.run { self.status = "Scan stopped."; self.isWorking = false }; return }
             let exactSet = Set(exact.flatMap { $0.items.map(\.id) })
-            let photos = MediaScanner.similarPhotos(items: items, excluding: exactSet, exhaustive: exhaustive, progress: progress)
+            let photos = MediaScanner.similarPhotos(items: items, excluding: exactSet, exhaustive: exhaustive, crossRootOnly: crossRootOnly, progress: progress)
+            guard !Task.isCancelled else { await MainActor.run { self.status = "Scan stopped."; self.isWorking = false }; return }
             await MainActor.run {
                 self.allItems = items
                 self.companionByID = companions
                 self.exactGroups = exact
                 self.exactIDs = exactSet
-                self.photoPairs = photos
+                self.photoPairs = self.applyCompanionAwarePhotoSuggestions(photos)
                 self.section = exact.isEmpty ? .photos : .exact
                 self.page = 0
                 self.hasScanned = true
                 self.isWorking = false
                 self.status = "Done: \(items.count) media files, \(exact.count) exact-copy group(s), \(photos.count) visually confirmed photo pair(s). Video analysis is optional."
+                self.activeTask = nil
             }
         }
     }
 
     func analyzeVideos() {
         guard hasScanned, !isWorking else { return }
+        activeTask?.cancel()
         isWorking = true
         status = "Analyzing non-identical videos using three sampled frames…"
         let items = allItems, exclusions = exactIDs
-        Task.detached(priority: .userInitiated) {
+        let crossRootOnly = rootB != nil
+        activeTask = Task.detached(priority: .userInitiated) {
             let progress: (String) -> Void = { text in Task { @MainActor in self.status = text } }
-            let pairs = MediaScanner.similarVideos(items: items, excluding: exclusions, progress: progress)
+            let pairs = MediaScanner.similarVideos(items: items, excluding: exclusions, crossRootOnly: crossRootOnly, progress: progress)
+            guard !Task.isCancelled else { await MainActor.run { self.status = "Video analysis stopped."; self.isWorking = false }; return }
             await MainActor.run {
                 self.videoPairs = pairs
                 self.section = .videos
@@ -730,8 +776,17 @@ final class ReviewModel: ObservableObject {
                 self.isWorking = false
                 let suggestions = pairs.filter { $0.suggestedTrashID != nil }.count
                 self.status = "Video review complete: \(pairs.count) likely pair(s), \(suggestions) automatic lower-resolution suggestion(s). Exact identical videos are in Exact Copies."
+                self.activeTask = nil
             }
         }
+    }
+
+    func stopCurrentWork() {
+        guard isWorking else { return }
+        activeTask?.cancel()
+        activeTask = nil
+        isWorking = false
+        status = "Stopped."
     }
 
     func toggle(_ item: MediaItem, against other: MediaItem? = nil) {
@@ -750,11 +805,47 @@ final class ReviewModel: ObservableObject {
 
     func selectExactKeeping(preferredRoot: String?) {
         for group in exactGroups {
-            let keep: MediaItem
-            if let preferredRoot, let preferred = group.items.first(where: { $0.rootLabel == preferredRoot }) { keep = preferred }
-            else { keep = group.items.sorted { $0.relativePath < $1.relativePath }.first! }
+            let keep = chooseKeepItem(in: group, preferredRoot: preferredRoot)
             for item in group.items where item.id != keep.id { selectedIDs.insert(item.id) }
             selectedIDs.remove(keep.id)
+        }
+    }
+
+    private func chooseKeepItem(in group: ExactGroup, preferredRoot: String?) -> MediaItem {
+        let sorted = group.items.sorted { $0.relativePath < $1.relativePath }
+        if let preferredRoot {
+            let candidates = sorted.filter { $0.rootLabel == preferredRoot }
+            if let chosen = companionPreferredItem(from: candidates) { return chosen }
+        }
+        if let chosen = companionPreferredItem(from: sorted) { return chosen }
+        return sorted.first!
+    }
+
+    private func companionPreferredItem(from items: [MediaItem]) -> MediaItem? {
+        guard !items.isEmpty else { return nil }
+        return items.max { a, b in
+            let aHasCompanion = companionByID[a.id] != nil
+            let bHasCompanion = companionByID[b.id] != nil
+            if aHasCompanion != bHasCompanion { return !aHasCompanion && bHasCompanion }
+            if a.byteSize != b.byteSize { return a.byteSize < b.byteSize }
+            return a.relativePath > b.relativePath
+        }
+    }
+
+    private func applyCompanionAwarePhotoSuggestions(_ pairs: [ReviewPair]) -> [ReviewPair] {
+        pairs.map { pair in
+            guard pair.type == .similarImage else { return pair }
+            guard pair.suggestedTrashID == nil else { return pair }
+            let leftCompanion = companionByID[pair.left.id] != nil
+            let rightCompanion = companionByID[pair.right.id] != nil
+            guard leftCompanion != rightCompanion else { return pair }
+            let trash = leftCompanion ? pair.right : pair.left
+            return ReviewPair(
+                id: pair.id, left: pair.left, right: pair.right, type: pair.type,
+                similarityDistance: pair.similarityDistance, reason: pair.reason,
+                suggestedTrashID: trash.id,
+                suggestionText: "Companion-aware suggestion: keep the version stored with its .MOV companion to avoid splitting a Live Photo pair across roots."
+            )
         }
     }
 
@@ -793,6 +884,13 @@ final class ReviewModel: ObservableObject {
             showMessage(title: "Two matched alternatives are selected",
                         text: "Both files in a visual-match row are selected:\n\n\(conflict.left.relativePath)\n\(conflict.right.relativePath)\n\nReview overlapping variants and leave at least one of this matched pair unselected before moving files to Trash.")
             return
+        }
+        for cluster in variantClusters(from: photoPairs + videoPairs) where cluster.count > 1 {
+            if cluster.isSubset(of: selectedIDs) {
+                showMessage(title: "Keep one file in each variant cluster",
+                            text: "All files in a linked variant cluster are selected. Leave at least one file unselected before moving to Trash.")
+                return
+            }
         }
 
         for group in exactGroups where group.items.allSatisfy({ selectedIDs.contains($0.id) }) {
@@ -845,6 +943,29 @@ final class ReviewModel: ObservableObject {
 
     private func showMessage(title: String, text: String) {
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = text; alert.addButton(withTitle: "OK"); alert.runModal()
+    }
+
+    private func variantClusters(from pairs: [ReviewPair]) -> [Set<String>] {
+        var adjacency: [String: Set<String>] = [:]
+        for pair in pairs {
+            adjacency[pair.left.id, default: []].insert(pair.right.id)
+            adjacency[pair.right.id, default: []].insert(pair.left.id)
+        }
+        var seen = Set<String>()
+        var groups: [Set<String>] = []
+        for start in adjacency.keys where !seen.contains(start) {
+            var stack = [start]
+            var component = Set<String>()
+            while let current = stack.popLast() {
+                if !seen.insert(current).inserted { continue }
+                component.insert(current)
+                for neighbor in adjacency[current] ?? [] where !seen.contains(neighbor) {
+                    stack.append(neighbor)
+                }
+            }
+            groups.append(component)
+        }
+        return groups
     }
 }
 
@@ -927,6 +1048,60 @@ struct PairCard: View {
     }
 }
 
+struct VariantClusterCard: View {
+    @EnvironmentObject var model: ReviewModel
+    let cluster: ContentView.PairCluster
+    var uniqueItems: [MediaItem] {
+        var byID: [String: MediaItem] = [:]
+        for pair in cluster.pairs {
+            byID[pair.left.id] = pair.left
+            byID[pair.right.id] = pair.right
+        }
+        return byID.values.sorted { $0.relativePath < $1.relativePath }
+    }
+    var rootAItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "A" } }
+    var rootBItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "B" } }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Variant cluster · \(cluster.itemCount) files · \(cluster.pairs.count) related matches")
+                .font(.headline).foregroundStyle(.orange)
+            Text("Grouped by root. Each file is shown once; selecting it applies everywhere it appears.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Root A").font(.subheadline).fontWeight(.semibold)
+                    ForEach(rootAItems) { item in
+                        MediaSideCard(item: item, other: nil, suggested: false)
+                    }
+                    if rootAItems.isEmpty { Text("No files in this cluster from Root A").font(.caption).foregroundStyle(.secondary) }
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Root B").font(.subheadline).fontWeight(.semibold)
+                    ForEach(rootBItems) { item in
+                        MediaSideCard(item: item, other: nil, suggested: false)
+                    }
+                    if rootBItems.isEmpty { Text("No files in this cluster from Root B").font(.caption).foregroundStyle(.secondary) }
+                }
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Related pair links").font(.subheadline).fontWeight(.semibold)
+                ForEach(cluster.pairs) { pair in
+                    HStack(alignment: .top) {
+                        Image(systemName: "link").foregroundStyle(.secondary)
+                        Text("\(pair.left.rootLabel):\(pair.left.name) ↔ \(pair.right.rootLabel):\(pair.right.name)")
+                        Spacer()
+                        if let d = pair.similarityDistance { Text(String(format: "%.4f", d)).foregroundStyle(.secondary) }
+                    }.font(.caption)
+                }
+            }.padding(.top, 4)
+        }
+        .padding(14)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+}
+
 struct ExactGroupCard: View {
     @EnvironmentObject var model: ReviewModel
     let group: ExactGroup
@@ -973,18 +1148,51 @@ struct SelectedRow: View {
 
 struct ContentView: View {
     @EnvironmentObject var model: ReviewModel
+    struct PairCluster: Identifiable {
+        let id: String
+        let pairs: [ReviewPair]
+        let itemCount: Int
+    }
+    func clusters(for pairs: [ReviewPair]) -> [PairCluster] {
+        guard !pairs.isEmpty else { return [] }
+        var adjacency: [String: Set<String>] = [:]
+        var pairIDsByItem: [String: [ReviewPair]] = [:]
+        for pair in pairs {
+            adjacency[pair.left.id, default: []].insert(pair.right.id)
+            adjacency[pair.right.id, default: []].insert(pair.left.id)
+            pairIDsByItem[pair.left.id, default: []].append(pair)
+            pairIDsByItem[pair.right.id, default: []].append(pair)
+        }
+        var seenItems = Set<String>()
+        var clusters: [PairCluster] = []
+        for start in adjacency.keys where !seenItems.contains(start) {
+            var queue = [start]
+            var itemSet = Set<String>()
+            var pairMap: [String: ReviewPair] = [:]
+            while let item = queue.popLast() {
+                if !seenItems.insert(item).inserted { continue }
+                itemSet.insert(item)
+                for pair in pairIDsByItem[item] ?? [] { pairMap[pair.id] = pair }
+                for next in adjacency[item] ?? [] where !seenItems.contains(next) { queue.append(next) }
+            }
+            let clusteredPairs = pairMap.values.sorted { $0.left.relativePath < $1.left.relativePath }
+            let clusterID = itemSet.sorted().joined(separator: "|")
+            clusters.append(PairCluster(id: clusterID, pairs: clusteredPairs, itemCount: itemSet.count))
+        }
+        return clusters.sorted { ($0.pairs.first?.left.relativePath ?? "") < ($1.pairs.first?.left.relativePath ?? "") }
+    }
     var body: some View { VStack(spacing: 0) { header; Divider(); toolbar; Divider(); results }.frame(minWidth: 1120, minHeight: 780) }
     var header: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Media Duplicate Reviewer").font(.system(size: 27, weight: .bold))
-            Text("Exact copies are grouped across all selected folders, including within one root. Similar photos require visual confirmation; ambiguous multi-variant matches never auto-select.").font(.subheadline).foregroundStyle(.secondary)
+            Text("Exact copies are grouped across all selected folders, including within one root. Similar photos/videos use within-root matching only when one root is selected; with two roots selected, they compare Root A ↔ Root B only. Ambiguous multi-variant matches never auto-select.").font(.subheadline).foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 rootChooser(label: "A", url: model.rootA) { model.chooseRoot(label: "A") }
                 rootChooser(label: "B (optional)", url: model.rootB) { model.chooseRoot(label: "B") }
                 if model.rootB != nil { Button("Clear B") { model.clearRootB() } }
                 Button("Scan & Compare") { model.startScan() }.buttonStyle(.borderedProminent).disabled(model.isWorking || model.rootA == nil)
             }
-            Toggle("Exhaustive photo scan (slow; includes matches within each selected root and across roots)", isOn: $model.useExhaustivePhotoScan).font(.caption)
+            Toggle("Exhaustive photo scan (slow; one root: within that root, two roots: Root A ↔ Root B only)", isOn: $model.useExhaustivePhotoScan).font(.caption)
         }.padding(18)
     }
     func rootChooser(label: String, url: URL?, action: @escaping () -> Void) -> some View {
@@ -994,6 +1202,7 @@ struct ContentView: View {
         VStack(spacing: 10) {
             HStack { Text(model.status).font(.callout); if model.isWorking { ProgressView().controlSize(.small) }; Spacer()
                 if model.hasScanned {
+                    if model.isWorking { Button("Stop") { model.stopCurrentWork() }.tint(.orange) }
                     Button("Analyze Non-identical Videos") { model.analyzeVideos() }.disabled(model.isWorking)
                     if model.section == .exact {
                         Menu("Select Exact Extras") {
@@ -1007,6 +1216,7 @@ struct ContentView: View {
                     Button("Clear Selection") { model.clearSelection() }.disabled(model.selectedIDs.isEmpty)
                     Button("Move Selected to Trash (\(model.selectedIDs.count))") { model.moveSelectedToTrash() }.buttonStyle(.borderedProminent).tint(.red).disabled(model.selectedIDs.isEmpty || model.isWorking)
                 }
+                if !model.hasScanned && model.isWorking { Button("Stop") { model.stopCurrentWork() }.tint(.orange) }
             }
             if model.hasScanned {
                 HStack {
@@ -1033,10 +1243,16 @@ struct ContentView: View {
                     ForEach(model.currentExactPage) { ExactGroupCard(group: $0) }
                 case .photos:
                     if model.photoPairs.isEmpty { empty("No visually confirmed non-identical photo pairs found with the current scan mode.") }
-                    ForEach(model.currentPairPage) { PairCard(pair: $0) }
+                    ForEach(clusters(for: model.currentPairPage)) { cluster in
+                        if cluster.pairs.count > 1 { VariantClusterCard(cluster: cluster) }
+                        else { ForEach(cluster.pairs) { PairCard(pair: $0) } }
+                    }
                 case .videos:
                     if model.videoPairs.isEmpty { empty("Run Analyze Non-identical Videos. Exact identical videos already appear under Exact Copies.") }
-                    ForEach(model.currentPairPage) { PairCard(pair: $0) }
+                    ForEach(clusters(for: model.currentPairPage)) { cluster in
+                        if cluster.pairs.count > 1 { VariantClusterCard(cluster: cluster) }
+                        else { ForEach(cluster.pairs) { PairCard(pair: $0) } }
+                    }
                 case .selected:
                     if model.selectedItems.isEmpty { empty("No files selected for Trash.") }
                     ForEach(model.selectedItems) { SelectedRow(item: $0) }

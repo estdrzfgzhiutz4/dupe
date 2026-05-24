@@ -21,7 +21,7 @@ fi
 
 /bin/mkdir -p "$MACOS" "$CONTENTS/Resources"
 
-echo "Building native Media Duplicate Reviewer 2.1…"
+echo "Building native Media Duplicate Reviewer 2.6…"
 SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
 /bin/rm -f "$TEMP_EXECUTABLE"
 
@@ -52,8 +52,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Media Duplicate Reviewer</string>
   <key>CFBundleDisplayName</key><string>Media Duplicate Reviewer</string>
   <key>CFBundleIdentifier</key><string>local.media-duplicate-reviewer</string>
-  <key>CFBundleVersion</key><string>2.1.0</string>
-  <key>CFBundleShortVersionString</key><string>2.1.0</string>
+  <key>CFBundleVersion</key><string>2.6.0</string>
+  <key>CFBundleShortVersionString</key><string>2.6.0</string>
   <key>CFBundleExecutable</key><string>MediaDuplicateReviewer</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
