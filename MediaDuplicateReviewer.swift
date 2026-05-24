@@ -1018,6 +1018,46 @@ struct PairCard: View {
     }
 }
 
+struct VariantClusterCard: View {
+    @EnvironmentObject var model: ReviewModel
+    let cluster: ContentView.PairCluster
+    var uniqueItems: [MediaItem] {
+        var byID: [String: MediaItem] = [:]
+        for pair in cluster.pairs {
+            byID[pair.left.id] = pair.left
+            byID[pair.right.id] = pair.right
+        }
+        return byID.values.sorted { $0.relativePath < $1.relativePath }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Variant cluster · \(cluster.itemCount) files · \(cluster.pairs.count) related matches")
+                .font(.headline).foregroundStyle(.orange)
+            Text("Files below are linked. Each file is shown once; selecting it applies everywhere it appears.")
+                .font(.caption).foregroundStyle(.secondary)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                ForEach(uniqueItems) { item in
+                    MediaSideCard(item: item, other: nil, suggested: false)
+                }
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Match links").font(.subheadline).fontWeight(.semibold)
+                ForEach(cluster.pairs) { pair in
+                    HStack(alignment: .top) {
+                        Image(systemName: "link").foregroundStyle(.secondary)
+                        Text("\(pair.left.name) (\(pair.left.rootLabel)) ↔ \(pair.right.name) (\(pair.right.rootLabel))")
+                        Spacer()
+                        if let d = pair.similarityDistance { Text(String(format: "%.4f", d)).foregroundStyle(.secondary) }
+                    }.font(.caption)
+                }
+            }.padding(.top, 4)
+        }
+        .padding(14)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+}
+
 struct ExactGroupCard: View {
     @EnvironmentObject var model: ReviewModel
     let group: ExactGroup
@@ -1160,24 +1200,14 @@ struct ContentView: View {
                 case .photos:
                     if model.photoPairs.isEmpty { empty("No visually confirmed non-identical photo pairs found with the current scan mode.") }
                     ForEach(clusters(for: model.currentPairPage)) { cluster in
-                        if cluster.pairs.count > 1 {
-                            Text("Linked variant cluster: \(cluster.itemCount) files across \(cluster.pairs.count) related comparisons. Selecting one file affects all rows where that same file appears.")
-                                .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 6)
-                        }
-                        ForEach(cluster.pairs) { PairCard(pair: $0) }
+                        if cluster.pairs.count > 1 { VariantClusterCard(cluster: cluster) }
+                        else { ForEach(cluster.pairs) { PairCard(pair: $0) } }
                     }
                 case .videos:
                     if model.videoPairs.isEmpty { empty("Run Analyze Non-identical Videos. Exact identical videos already appear under Exact Copies.") }
                     ForEach(clusters(for: model.currentPairPage)) { cluster in
-                        if cluster.pairs.count > 1 {
-                            Text("Linked variant cluster: \(cluster.itemCount) files across \(cluster.pairs.count) related comparisons. Selecting one file affects all rows where that same file appears.")
-                                .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 6)
-                        }
-                        ForEach(cluster.pairs) { PairCard(pair: $0) }
+                        if cluster.pairs.count > 1 { VariantClusterCard(cluster: cluster) }
+                        else { ForEach(cluster.pairs) { PairCard(pair: $0) } }
                     }
                 case .selected:
                     if model.selectedItems.isEmpty { empty("No files selected for Trash.") }
