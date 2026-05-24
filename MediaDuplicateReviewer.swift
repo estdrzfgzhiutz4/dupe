@@ -992,17 +992,22 @@ final class ReviewModel: ObservableObject {
         status = "Analyzing non-identical videos using three sampled frames…"
         let items = allItems, exclusions = exactIDs
         let crossRootOnly = rootB != nil
+        let mode = policy.videoSamplingMode
+        let intervalSeconds = policy.videoSamplingIntervalSeconds
+        let minimumMatchingFrames = policy.minimumVideoMatchingFrames
+        let confirmThreshold = policy.videoVisualConfirmThreshold
+        let suggestThreshold = policy.videoSuggestionThreshold
         activeTask = Task.detached(priority: .userInitiated) {
             let progress: (String) -> Void = { text in Task { @MainActor in self.status = text } }
             let pairs = MediaScanner.similarVideos(
                 items: items,
                 excluding: exclusions,
                 crossRootOnly: crossRootOnly,
-                mode: self.policy.videoSamplingMode,
-                intervalSeconds: self.policy.videoSamplingIntervalSeconds,
-                minimumMatchingFrames: self.policy.minimumVideoMatchingFrames,
-                confirmThreshold: self.policy.videoVisualConfirmThreshold,
-                suggestThreshold: self.policy.videoSuggestionThreshold,
+                mode: mode,
+                intervalSeconds: intervalSeconds,
+                minimumMatchingFrames: minimumMatchingFrames,
+                confirmThreshold: confirmThreshold,
+                suggestThreshold: suggestThreshold,
                 progress: progress
             )
             guard !Task.isCancelled else { await MainActor.run { self.status = "Video analysis stopped."; self.isWorking = false }; return }
@@ -1160,7 +1165,10 @@ final class ReviewModel: ObservableObject {
         let keepLeft = lScore >= rScore
         let trash = keepLeft ? right : left
         let confidence = delta >= 0.9 ? "High confidence suggestion" : "Low confidence, review manually"
-        let text = "Keeper strategy score \(String(format: \"%.2f\", keepLeft ? lScore : rScore)) vs \(String(format: \"%.2f\", keepLeft ? rScore : lScore)); keeping \(keepLeft ? \"left\" : \"right\") based on quality/size/metadata/companion weighting."
+        let keepScoreText = String(format: "%.2f", keepLeft ? lScore : rScore)
+        let otherScoreText = String(format: "%.2f", keepLeft ? rScore : lScore)
+        let sideText = keepLeft ? "left" : "right"
+        let text = "Keeper strategy score \(keepScoreText) vs \(otherScoreText); keeping \(sideText) based on quality/size/metadata/companion weighting."
         return (trash.id, confidence, text)
     }
 
