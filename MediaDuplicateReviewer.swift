@@ -885,6 +885,13 @@ final class ReviewModel: ObservableObject {
                         text: "Both files in a visual-match row are selected:\n\n\(conflict.left.relativePath)\n\(conflict.right.relativePath)\n\nReview overlapping variants and leave at least one of this matched pair unselected before moving files to Trash.")
             return
         }
+        for cluster in variantClusters(from: photoPairs + videoPairs) where cluster.count > 1 {
+            if cluster.isSubset(of: selectedIDs) {
+                showMessage(title: "Keep one file in each variant cluster",
+                            text: "All files in a linked variant cluster are selected. Leave at least one file unselected before moving to Trash.")
+                return
+            }
+        }
 
         for group in exactGroups where group.items.allSatisfy({ selectedIDs.contains($0.id) }) {
             showMessage(title: "Keep one exact copy", text: "Your selection includes every exact copy of \(group.items.first?.name ?? "a file"). Unselect one before continuing.")
@@ -936,6 +943,29 @@ final class ReviewModel: ObservableObject {
 
     private func showMessage(title: String, text: String) {
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = text; alert.addButton(withTitle: "OK"); alert.runModal()
+    }
+
+    private func variantClusters(from pairs: [ReviewPair]) -> [Set<String>] {
+        var adjacency: [String: Set<String>] = [:]
+        for pair in pairs {
+            adjacency[pair.left.id, default: []].insert(pair.right.id)
+            adjacency[pair.right.id, default: []].insert(pair.left.id)
+        }
+        var seen = Set<String>()
+        var groups: [Set<String>] = []
+        for start in adjacency.keys where !seen.contains(start) {
+            var stack = [start]
+            var component = Set<String>()
+            while let current = stack.popLast() {
+                if !seen.insert(current).inserted { continue }
+                component.insert(current)
+                for neighbor in adjacency[current] ?? [] where !seen.contains(neighbor) {
+                    stack.append(neighbor)
+                }
+            }
+            groups.append(component)
+        }
+        return groups
     }
 }
 
@@ -1029,23 +1059,37 @@ struct VariantClusterCard: View {
         }
         return byID.values.sorted { $0.relativePath < $1.relativePath }
     }
+    var rootAItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "A" } }
+    var rootBItems: [MediaItem] { uniqueItems.filter { $0.rootLabel == "B" } }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Variant cluster · \(cluster.itemCount) files · \(cluster.pairs.count) related matches")
                 .font(.headline).foregroundStyle(.orange)
-            Text("Files below are linked. Each file is shown once; selecting it applies everywhere it appears.")
+            Text("Grouped by root. Each file is shown once; selecting it applies everywhere it appears.")
                 .font(.caption).foregroundStyle(.secondary)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                ForEach(uniqueItems) { item in
-                    MediaSideCard(item: item, other: nil, suggested: false)
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Root A").font(.subheadline).fontWeight(.semibold)
+                    ForEach(rootAItems) { item in
+                        MediaSideCard(item: item, other: nil, suggested: false)
+                    }
+                    if rootAItems.isEmpty { Text("No files in this cluster from Root A").font(.caption).foregroundStyle(.secondary) }
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Root B").font(.subheadline).fontWeight(.semibold)
+                    ForEach(rootBItems) { item in
+                        MediaSideCard(item: item, other: nil, suggested: false)
+                    }
+                    if rootBItems.isEmpty { Text("No files in this cluster from Root B").font(.caption).foregroundStyle(.secondary) }
                 }
             }
             VStack(alignment: .leading, spacing: 5) {
-                Text("Match links").font(.subheadline).fontWeight(.semibold)
+                Text("Related pair links").font(.subheadline).fontWeight(.semibold)
                 ForEach(cluster.pairs) { pair in
                     HStack(alignment: .top) {
                         Image(systemName: "link").foregroundStyle(.secondary)
-                        Text("\(pair.left.name) (\(pair.left.rootLabel)) ↔ \(pair.right.name) (\(pair.right.rootLabel))")
+                        Text("\(pair.left.rootLabel):\(pair.left.name) ↔ \(pair.right.rootLabel):\(pair.right.name)")
                         Spacer()
                         if let d = pair.similarityDistance { Text(String(format: "%.4f", d)).foregroundStyle(.secondary) }
                     }.font(.caption)
